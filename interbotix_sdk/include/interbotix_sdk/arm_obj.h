@@ -73,6 +73,9 @@ struct Info
 class RobotArm
 {
 public:
+    /// @brief Node free constructor for the RobotArm
+    RobotArm(const std::string robot_name, const std::string robot_model, const double timer_hz = 100);
+
     /// @brief Constructor for the RobotArm
     explicit RobotArm(ros::NodeHandle *node_handle, const std::string robot_name, const std::string robot_model, const double timer_hz = 100);
 
@@ -169,6 +172,38 @@ public:
 
     /// @brief Torque off all motors (including the gripper)
     void arm_torque_off(void);
+
+    /// @brief Reads current states from all the motors
+    sensor_msgs::JointState arm_get_joint_states();
+
+    /// @brief Send joint trajectory for the arm (excludes gripper)
+    /// @param msg - user-provided joint trajectory using the trajectory_msgs::JointTrajectory message type
+    void arm_send_joint_trajectory(const trajectory_msgs::JointTrajectory &msg);
+
+    /// @brief Send joint trajectory for the gripper only
+    /// @param msg - user-provided joint trajectory using the trajectory_msgs::JointTrajectory message type
+    /// @details - Commands should only be for the 'left_finger' joint and must specify half the desired distance between the fingers
+    void send_gripper_trajectory(const trajectory_msgs::JointTrajectory &msg);
+
+    /// @brief Send any type of joint commands
+    /// @param msg - custom message that accepts a vector of position [rad], velocity [rad/s], current [mA], or pwm commands
+    void arm_send_joint_commands(const interbotix_sdk::JointCommands &msg);
+
+    /// @brief Send any type of gripper command
+    /// @param msg - accepts either an angular position [rad], linear position [m], velocity [rad/s], current [mA], or pwm command
+    void arm_send_gripper_command(const std_msgs::Float64 &msg);
+
+    /// @brief Send any type of command to a specified joint
+    /// @param msg - accepts either an angular position [rad], velocity [rad/s], current [mA], or pwm command
+    void arm_send_single_joint_command(const interbotix_sdk::SingleCommand &msg);
+
+    /// @brief Set the operating modes (position, velocity, current, pwm) and set profiles
+    /// @param res [out] - no message is returned
+    bool arm_set_operating_modes(interbotix_sdk::OperatingModes::Request &req);
+
+    /// @brief Get information about the robot
+    /// @param res [out] - all types of robot info!!!!!
+    bool arm_get_robot_info(interbotix_sdk::RobotInfo::Response &res);
 
 private:
     ros::NodeHandle node;                                                                             // ROS node handler

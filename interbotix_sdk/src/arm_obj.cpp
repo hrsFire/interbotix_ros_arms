@@ -1,5 +1,22 @@
 #include "interbotix_sdk/arm_obj.h"
 
+/// @brief Node free constructor for the RobotArm
+RobotArm::RobotArm(const std::string robot_name, const std::string robot_model, const double timer_hz)
+    : robot_name(robot_name), robot_model(robot_model), timer_hz(timer_hz)
+{
+  arm_init_port();
+  arm_get_motor_configs();// @TODO: ros param
+  arm_ping_motors();
+  arm_load_motor_configs();
+  arm_init_controlItems();
+  arm_init_SDK_handlers();
+  arm_init_operating_modes();// @TODO: ros param
+  arm_init_gripper();// @TODO: ros param
+  arm_init_pid_controllers();// @TODO: ros param
+  arm_init_timers();// @TODO: parameters
+  ROS_INFO("All motors ready to go!");
+}
+
 /// @brief Constructor for the RobotArm
 RobotArm::RobotArm(ros::NodeHandle *node_handle, const std::string robot_name, const std::string robot_model, const double timer_hz)
     : node(*node_handle), robot_name(robot_name), robot_model(robot_model), timer_hz(timer_hz)
@@ -357,6 +374,438 @@ void RobotArm::arm_torque_off(void)
   for (auto const& joint:all_joints)
     dxl_wb.torqueOff(joint.motor_id);
   ROS_INFO("Robot torqued off!");
+}
+
+/// @brief Reads current states from all the motors
+sensor_msgs::JointState RobotArm::arm_get_joint_states()
+{
+  bool result = false;
+  const char* log = NULL;
+
+  sensor_msgs::JointState joint_state_msg;
+
+  int32_t get_current[all_joints.size()];
+  int32_t get_velocity[all_joints.size()];
+  int32_t get_position[all_joints.size()];
+
+  if (dxl_wb.getProtocolVersion() == 2.0f)
+  {
+
+    result = dxl_wb.syncRead(SYNC_READ_HANDLER_FOR_PRESENT_POSITION_VELOCITY_CURRENT,
+                                joint_ids_read,
+                                all_joints.size(),
+                                &log);
+    arm_check_error(result, &log);
+    result = dxl_wb.getSyncReadData(SYNC_READ_HANDLER_FOR_PRESENT_POSITION_VELOCITY_CURRENT,
+                                                  joint_ids_read,
+                                                  all_joints.size(),
+                                                  control_items["Present_Current"]->address,
+                                                  control_items["Present_Current"]->data_length,
+                                                  get_current,
+                                                  &log);
+    arm_check_error(result, &log);
+    result = dxl_wb.getSyncReadData(SYNC_READ_HANDLER_FOR_PRESENT_POSITION_VELOCITY_CURRENT,
+                                                  joint_ids_read,
+                                                  all_joints.size(),
+                                                  control_items["Present_Velocity"]->address,
+                                                  control_items["Present_Velocity"]->data_length,
+                                                  get_velocity,
+                                                  &log);
+    arm_check_error(result, &log);
+    result = dxl_wb.getSyncReadData(SYNC_READ_HANDLER_FOR_PRESENT_POSITION_VELOCITY_CURRENT,
+                                                  joint_ids_read,
+                                                  all_joints.size(),
+                                                  control_items["Present_Position"]->address,
+                                                  control_items["Present_Position"]->data_length,
+                                                  get_position,
+                                                  &log);
+    arm_check_error(result, &log);
+
+    uint8_t index = 0;
+    for(auto const& joint:all_joints)
+    {
+      double position = 0.0;
+      double velocity = 0.0;
+      double effort = 0.0;
+      // Convert raw register values to the metric system
+      if (strcmp(dxl_wb.getModelName(joint.motor_id), "XL-320") == 0) effort = dxl_wb.convertValue2Load(get_current[index]);
+      else  effort = dxl_wb.convertValue2Current(get_current[index]);
+      velocity = dxl_wb.convertValue2Velocity(joint.motor_id, get_velocity[index]);
+      position = dxl_wb.convertValue2Radian(joint.motor_id, get_position[index]);
+      joint_state_msg.name.push_back(joint.name);
+      joint_state_msg.effort.push_back(effort);
+      joint_state_msg.velocity.push_back(velocity);
+      joint_state_msg.position.push_back(position);
+      // If reading the 'gripper' motor, make sure to also add the finger positions in meters
+      if (joint.name == "gripper" && use_default_gripper_bar && use_default_gripper_fingers)
+      {
+        joint_state_msg.name.push_back("left_finger");
+        joint_state_msg.name.push_back("right_finger");
+        gripper_effort = effort;
+        position = arm_calculate_gripper_linear_position(position);
+        joint_state_msg.position.push_back(position);
+        joint_state_msg.position.push_back(-position);
+        // put a '0' placeholder in the velocity and effort fields for the fingers as well
+        joint_state_msg.velocity.push_back(0);
+        joint_state_msg.velocity.push_back(0);
+        joint_state_msg.effort.push_back(0);
+        joint_state_msg.effort.push_back(0);
+      }
+      index++;
+    }
+  }
+  else if(dxl_wb.getProtocolVersion() == 1.0f)
+  {
+    uint16_t length_of_data = control_items["Present_Position"]->data_length +
+                              control_items["Present_Velocity"]->data_length +
+                              control_items["Present_Current"]->data_length;
+    uint32_t get_all_data[length_of_data];
+
+    for (auto const& joint:all_joints)
+    {
+      result = dxl_wb.readRegister(joint.motor_id,
+                                     control_items["Present_Position"]->address,
+                                     length_of_data,
+                                     get_all_data,
+                                     &log);
+      arm_check_error(result, &log);
+      int16_t effort_raw = DXL_MAKEWORD(get_all_data[4], get_all_data[5]);
+      int32_t velocity_raw = DXL_MAKEWORD(get_all_data[2], get_all_data[3]);
+      int32_t position_raw = DXL_MAKEWORD(get_all_data[0], get_all_data[1]);
+
+      double position = 0.0;
+      double velocity = 0.0;
+      double effort = 0.0;
+
+      // Convert raw register values to the metric system
+      effort = dxl_wb.convertValue2Load(effort_raw);
+      velocity = dxl_wb.convertValue2Velocity(joint.motor_id, velocity_raw);
+      position = dxl_wb.convertValue2Radian(joint.motor_id, position_raw);
+
+      joint_state_msg.name.push_back(joint.name);
+      joint_state_msg.effort.push_back(effort);
+      joint_state_msg.velocity.push_back(velocity);
+      joint_state_msg.position.push_back(position);
+      // If reading the 'gripper' motor, make sure to also add the finger positions in meters
+      if (joint.name == "gripper" && use_default_gripper_bar && use_default_gripper_fingers)
+      {
+        joint_state_msg.name.push_back("left_finger");
+        joint_state_msg.name.push_back("right_finger");
+        gripper_effort = effort;
+        position = arm_calculate_gripper_linear_position(position);
+        joint_state_msg.position.push_back(position);
+        joint_state_msg.position.push_back(-position);
+        // put a '0' placeholder in the velocity and effort fields for the fingers as well
+        joint_state_msg.velocity.push_back(0);
+        joint_state_msg.velocity.push_back(0);
+        joint_state_msg.effort.push_back(0);
+        joint_state_msg.effort.push_back(0);
+      }
+    }
+  }
+  // Publish the message to the joint_states topic
+  joint_state_msg.header.stamp = ros::Time::now();
+  return joint_state_msg;
+}
+
+/// @brief Send joint trajectory for the arm (excludes gripper)
+/// @param msg - user-provided joint trajectory using the trajectory_msgs::JointTrajectory message type
+void RobotArm::arm_send_joint_trajectory(const trajectory_msgs::JointTrajectory &msg) {
+  if (execute_joint_traj == false)
+  {
+    // For some reason, Moveit organizes the joint data in the trajectory message in alphabetical order. Thus,
+    // to make it easier to parse through the trajectory message, reorganize the data points in the vectors so that the order
+    // matches the order of the joints as they are published in the joint_states topic.
+    std::map<std::string, uint8_t> joint_order;
+    uint8_t cntr = 0;
+
+    for (auto const& name:msg.joint_names)
+    {
+      joint_order[name] = cntr;
+      cntr++;
+    }
+    jnt_tra_msg.joint_names.clear();
+    jnt_tra_msg.points.clear();
+    jnt_tra_msg.header = msg.header;
+    for (auto const& joint:arm_joints)
+      if (joint.name != "gripper")
+        jnt_tra_msg.joint_names.push_back(joint.name);
+
+    cntr = 0;
+    size_t pos_size = msg.points.at(0).positions.size();
+    size_t vel_size = msg.points.at(0).velocities.size();
+    size_t accel_size = msg.points.at(0).accelerations.size();
+
+    while(cntr < msg.points.size())
+    {
+      trajectory_msgs::JointTrajectoryPoint jnt_tra_point_msg;
+      jnt_tra_point_msg.time_from_start = msg.points.at(cntr).time_from_start;
+      for (auto const& joint:arm_joints)
+      {
+        if (joint.name != "gripper")
+        {
+          if (pos_size != 0)
+            jnt_tra_point_msg.positions.push_back(msg.points.at(cntr).positions.at(joint_order[joint.name]));
+          if (vel_size != 0)
+            jnt_tra_point_msg.velocities.push_back(msg.points.at(cntr).velocities.at(joint_order[joint.name]));
+          if (accel_size != 0)
+            jnt_tra_point_msg.accelerations.push_back(msg.points.at(cntr).accelerations.at(joint_order[joint.name]));
+        }
+      }
+      jnt_tra_msg.points.push_back(jnt_tra_point_msg);
+      cntr++;
+    }
+    // Make sure that the initial joint positions in the trajectory match the current
+    // joint states (with an arbitrary error less than 0.1 rad)
+    size_t itr = 0;
+    for (auto const& joint:arm_joints)
+    {
+      if (joint.name != "gripper")
+      {
+        if (!(fabs(jnt_tra_msg.points[0].positions.at(itr) - joint_states.position.at(itr)) < 0.1))
+        {
+          ROS_WARN("%s motor is not at the correct initial state.", joint_states.name.at(itr).c_str());
+          ROS_WARN("Expected state: %f, Actual State: %f.", jnt_tra_msg.points.at(0).positions.at(itr), joint_states.position.at(itr));
+        }
+        itr++;
+      }
+    }
+    ROS_INFO("Succeeded to get joint trajectory!");
+    joint_start_time = ros::Time::now().toSec();
+    execute_joint_traj = true;
+  }
+  else
+  {
+    ROS_WARN("Arm joints are still moving");
+  }
+}
+
+/// @brief Send joint trajectory for the gripper only
+/// @param msg - user-provided joint trajectory using the trajectory_msgs::JointTrajectory message type
+/// @details - Commands should only be for the 'left_finger' joint and must specify half the desired distance between the fingers
+void RobotArm::send_gripper_trajectory(const trajectory_msgs::JointTrajectory &msg) {
+  if (execute_gripper_traj == false)
+  {
+    gripper_tra_msg.joint_names.clear();
+    gripper_tra_msg.points.clear();
+    gripper_tra_msg = msg;
+
+    // Make sure that the initial gripper position in the trajectory matches the current
+    // gripper position (with an arbitrary error less than 0.1 rad)
+    // Note that MoveIt sends the desired position of the 'left_finger_link'. In the joint_states message,
+    // this is located right after the gripper position in radians (conveniently, this index matches arm_joints.size())
+    if (!(fabs(gripper_tra_msg.points.at(0).positions.at(0) - joint_states.position.at(arm_joints.size())) < 0.1))
+    {
+      ROS_WARN("Gripper motor is not at the correct initial state.");
+      ROS_WARN("Expected state: %f, Actual State: %f.", gripper_tra_msg.points.at(0).positions.at(0), joint_states.position.at(arm_joints.size()));
+    }
+
+    ROS_INFO("Succeeded to get gripper trajectory!");
+    gripper_start_time = ros::Time::now().toSec();
+    execute_gripper_traj = true;
+  }
+  else
+  {
+    ROS_WARN("Gripper is still moving");
+  }
+}
+
+void RobotArm::arm_send_joint_commands(const interbotix_sdk::JointCommands &msg) {
+  switch(arm_operating_mode)
+  {
+    case State::POSITION:
+    {
+      double joint_positions[msg.cmd.size()];
+      for (size_t i {0}; i < msg.cmd.size(); i++)
+        joint_positions[i] = msg.cmd.at(i);
+      arm_set_joint_positions(joint_positions);
+      break;
+    }
+    case State::VELOCITY:
+    {
+      double joint_velocities[msg.cmd.size()];
+      for (size_t i {0}; i < msg.cmd.size(); i++)
+        joint_velocities[i] = msg.cmd.at(i);
+      arm_set_joint_velocities(joint_velocities);
+      break;
+    }
+    case State::CURRENT:
+    {
+      double joint_currents[msg.cmd.size()];
+      for (size_t i {0}; i < msg.cmd.size(); i++)
+        joint_currents[i] = msg.cmd.at(i);
+      arm_set_joint_currents(joint_currents);
+      break;
+    }
+    case State::PWM:
+    {
+      int32_t joint_pwms[msg.cmd.size()];
+      for (size_t i {0}; i < msg.cmd.size(); i++)
+        joint_pwms[i] = (int32_t) msg.cmd.at(i);
+      arm_set_joint_pwms(joint_pwms);
+      break;
+    }
+    case State::NONE:
+    {
+      ROS_WARN("Arm joint control mode not set.");
+      break;
+    }
+    default:
+    {
+      ROS_ERROR("Invalid joint control mode.");
+    }
+  }
+}
+
+/// @brief Send any type of gripper command
+/// @param msg - accepts either an angular position [rad], linear position [m], velocity [rad/s], current [mA], or pwm command
+void RobotArm::arm_send_gripper_command(const std_msgs::Float64 &msg) {
+  switch(joint_map["gripper"].mode)
+  {
+    case State::POSITION:
+    {
+      arm_set_gripper_linear_position(msg.data);
+      break;
+    }
+    case State::EXT_POSITION:
+    {
+      arm_set_single_joint_angular_position("gripper", msg.data);
+      break;
+    }
+    case State::VELOCITY:
+    {
+      arm_set_single_joint_velocity("gripper", msg.data);
+      break;
+    }
+    case State::CURRENT:
+    {
+      arm_set_single_joint_current("gripper", msg.data);
+      break;
+    }
+    case State::PWM:
+    {
+      arm_set_single_joint_pwm("gripper", (int32_t) msg.data);
+      break;
+    }
+    case State::NONE:
+    {
+      ROS_WARN("Gripper control mode not set.");
+      break;
+    }
+    default:
+    {
+      ROS_ERROR("Invalid gripper control mode.");
+    }
+  }
+}
+
+/// @brief Send any type of command to a specified joint
+/// @param msg - accepts either an angular position [rad], velocity [rad/s], current [mA], or pwm command
+void RobotArm::arm_send_single_joint_command(const interbotix_sdk::SingleCommand &msg) {
+  switch(joint_map[msg.joint_name].mode)
+  {
+    case State::POSITION:
+    case State::EXT_POSITION:
+    {
+      arm_set_single_joint_angular_position(msg.joint_name, msg.cmd);
+      break;
+    }
+    case State::VELOCITY:
+    {
+      arm_set_single_joint_velocity(msg.joint_name, msg.cmd);
+      break;
+    }
+    case State::CURRENT:
+    {
+      arm_set_single_joint_current(msg.joint_name, msg.cmd);
+      break;
+    }
+    case State::PWM:
+    {
+      arm_set_single_joint_pwm(msg.joint_name, (int32_t) msg.cmd);
+      break;
+    }
+    case State::NONE:
+    {
+      ROS_WARN("%s control mode not set.", msg.joint_name.c_str());
+      break;
+    }
+    default:
+    {
+      ROS_ERROR("Invalid %s control mode.", msg.joint_name.c_str());
+    }
+  }
+}
+
+/// @brief Set the operating modes (position, velocity, current, pwm) and set profiles
+/// @param req - custom message of type 'OperatingModes'. Look at the service message for details
+bool RobotArm::arm_set_operating_modes(interbotix_sdk::OperatingModes::Request &req) {
+  bool result = true;
+  if (req.cmd == interbotix_sdk::OperatingModes::Request::GRIPPER || req.cmd == interbotix_sdk::OperatingModes::Request::ARM_JOINTS_AND_GRIPPER)
+  {
+    if (req.use_custom_profiles)
+      result = arm_set_single_joint_operating_mode("gripper", req.mode, req.profile_velocity, req.profile_acceleration);
+    else
+      result = arm_set_single_joint_operating_mode("gripper", req.mode);
+  }
+
+  if (!result)
+    return false;
+
+  if (req.cmd == interbotix_sdk::OperatingModes::Request::ARM_JOINTS_AND_GRIPPER || req.cmd == interbotix_sdk::OperatingModes::Request::ARM_JOINTS)
+  {
+    if (req.use_custom_profiles)
+      result = arm_set_joint_operating_mode(req.mode, req.profile_velocity, req.profile_acceleration);
+    else
+      result = arm_set_joint_operating_mode(req.mode);
+  }
+
+  if (!result)
+    return false;
+
+  if (req.cmd == interbotix_sdk::OperatingModes::Request::SINGLE_JOINT)
+  {
+    if (req.use_custom_profiles)
+      result = arm_set_single_joint_operating_mode(req.joint_name, req.mode, req.profile_velocity, req.profile_acceleration);
+    else
+      result = arm_set_single_joint_operating_mode(req.joint_name, req.mode);
+  }
+
+  if (!result)
+    return false;
+
+  return true;
+}
+
+/// @brief Get information about the robot
+/// @param res [out] - all types of robot info!!!!!
+bool RobotArm::arm_get_robot_info(interbotix_sdk::RobotInfo::Response &res) {
+  // Parse the urdf model to get joint position and velocity limits
+  urdf::Model model;
+  model.initParam(robot_name + "/robot_description");
+  for (auto const& joint:all_joints)
+  {
+    urdf::JointConstSharedPtr ptr;
+    if (joint.name == "gripper" && use_default_gripper_bar && use_default_gripper_fingers)
+    {
+      ptr = model.getJoint("left_finger");
+      res.lower_gripper_limit = ptr->limits->lower;
+      res.upper_gripper_limit = ptr->limits->upper;
+      res.use_gripper = true;
+    }
+    ptr = model.getJoint(joint.name);
+    res.lower_joint_limits.push_back(ptr->limits->lower);
+    res.upper_joint_limits.push_back(ptr->limits->upper);
+    res.velocity_limits.push_back(ptr->limits->velocity);
+    res.joint_names.push_back(joint.name);
+    res.joint_ids.push_back(joint.motor_id);
+  }
+
+  res.home_pos = home_positions;
+  res.sleep_pos = sleep_positions;
+  res.num_joints = joint_num_write;
+  res.num_single_joints = all_joints.size();
+  return true;
 }
 
 /// @brief Initializes the port to talk to the Dynamixel motors
@@ -794,205 +1243,28 @@ void RobotArm::arm_init_action_servers(void)
 /// @param msg - custom message that accepts a vector of position [rad], velocity [rad/s], or pwm commands
 void RobotArm::arm_write_joint_commands(const interbotix_sdk::JointCommands &msg)
 {
-  switch(arm_operating_mode)
-  {
-    case State::POSITION:
-    {
-      double joint_positions[msg.cmd.size()];
-      for (size_t i {0}; i < msg.cmd.size(); i++)
-        joint_positions[i] = msg.cmd.at(i);
-      arm_set_joint_positions(joint_positions);
-      break;
-    }
-    case State::VELOCITY:
-    {
-      double joint_velocities[msg.cmd.size()];
-      for (size_t i {0}; i < msg.cmd.size(); i++)
-        joint_velocities[i] = msg.cmd.at(i);
-      arm_set_joint_velocities(joint_velocities);
-      break;
-    }
-    case State::CURRENT:
-    {
-      double joint_currents[msg.cmd.size()];
-      for (size_t i {0}; i < msg.cmd.size(); i++)
-        joint_currents[i] = msg.cmd.at(i);
-      arm_set_joint_currents(joint_currents);
-      break;
-    }
-    case State::PWM:
-    {
-      int32_t joint_pwms[msg.cmd.size()];
-      for (size_t i {0}; i < msg.cmd.size(); i++)
-        joint_pwms[i] = (int32_t) msg.cmd.at(i);
-      arm_set_joint_pwms(joint_pwms);
-      break;
-    }
-    case State::NONE:
-    {
-      ROS_WARN("Arm joint control mode not set.");
-      break;
-    }
-    default:
-    {
-      ROS_ERROR("Invalid joint control mode.");
-    }
-  }
+  arm_send_joint_commands(msg);
 }
 
 /// @brief ROS Subscriber callback function to write any type of gripper command
 /// @param msg - accepts either an angular position [rad], linear position [m], velocity [rad/s], or pwm command
 void RobotArm::arm_write_gripper_command(const std_msgs::Float64 &msg)
 {
-  switch(joint_map["gripper"].mode)
-  {
-    case State::POSITION:
-    {
-      arm_set_gripper_linear_position(msg.data);
-      break;
-    }
-    case State::EXT_POSITION:
-    {
-      arm_set_single_joint_angular_position("gripper", msg.data);
-      break;
-    }
-    case State::VELOCITY:
-    {
-      arm_set_single_joint_velocity("gripper", msg.data);
-      break;
-    }
-    case State::CURRENT:
-    {
-      arm_set_single_joint_current("gripper", msg.data);
-      break;
-    }
-    case State::PWM:
-    {
-      arm_set_single_joint_pwm("gripper", (int32_t) msg.data);
-      break;
-    }
-    case State::NONE:
-    {
-      ROS_WARN("Gripper control mode not set.");
-      break;
-    }
-    default:
-    {
-      ROS_ERROR("Invalid gripper control mode.");
-    }
-  }
+  arm_send_gripper_command(msg);
 }
 
 /// @brief ROS Subscriber callback function to write any type of command to a specified joint
 /// @param msg - accepts either an angular position [rad], velocity [rad/s], current [mA], or pwm command
 void RobotArm::arm_write_single_joint_command(const interbotix_sdk::SingleCommand &msg)
 {
-  switch(joint_map[msg.joint_name].mode)
-  {
-    case State::POSITION:
-    case State::EXT_POSITION:
-    {
-      arm_set_single_joint_angular_position(msg.joint_name, msg.cmd);
-      break;
-    }
-    case State::VELOCITY:
-    {
-      arm_set_single_joint_velocity(msg.joint_name, msg.cmd);
-      break;
-    }
-    case State::CURRENT:
-    {
-      arm_set_single_joint_current(msg.joint_name, msg.cmd);
-      break;
-    }
-    case State::PWM:
-    {
-      arm_set_single_joint_pwm(msg.joint_name, (int32_t) msg.cmd);
-      break;
-    }
-    case State::NONE:
-    {
-      ROS_WARN("%s control mode not set.", msg.joint_name.c_str());
-      break;
-    }
-    default:
-    {
-      ROS_ERROR("Invalid %s control mode.", msg.joint_name.c_str());
-    }
-  }
+  arm_send_single_joint_command(msg);
 }
 
 /// @brief ROS Subscriber callback function to a user-provided joint trajectory for the arm (excludes gripper)
 /// @param msg - user-provided joint trajectory using the trajectory_msgs::JointTrajectory message type
 void RobotArm::arm_joint_trajectory_msg_callback(const trajectory_msgs::JointTrajectory &msg)
 {
-  if (execute_joint_traj == false)
-  {
-    // For some reason, Moveit organizes the joint data in the trajectory message in alphabetical order. Thus,
-    // to make it easier to parse through the trajectory message, reorganize the data points in the vectors so that the order
-    // matches the order of the joints as they are published in the joint_states topic.
-    std::map<std::string, uint8_t> joint_order;
-    uint8_t cntr = 0;
-
-    for (auto const& name:msg.joint_names)
-    {
-      joint_order[name] = cntr;
-      cntr++;
-    }
-    jnt_tra_msg.joint_names.clear();
-    jnt_tra_msg.points.clear();
-    jnt_tra_msg.header = msg.header;
-    for (auto const& joint:arm_joints)
-      if (joint.name != "gripper")
-        jnt_tra_msg.joint_names.push_back(joint.name);
-
-    cntr = 0;
-    size_t pos_size = msg.points.at(0).positions.size();
-    size_t vel_size = msg.points.at(0).velocities.size();
-    size_t accel_size = msg.points.at(0).accelerations.size();
-
-    while(cntr < msg.points.size())
-    {
-      trajectory_msgs::JointTrajectoryPoint jnt_tra_point_msg;
-      jnt_tra_point_msg.time_from_start = msg.points.at(cntr).time_from_start;
-      for (auto const& joint:arm_joints)
-      {
-        if (joint.name != "gripper")
-        {
-          if (pos_size != 0)
-            jnt_tra_point_msg.positions.push_back(msg.points.at(cntr).positions.at(joint_order[joint.name]));
-          if (vel_size != 0)
-            jnt_tra_point_msg.velocities.push_back(msg.points.at(cntr).velocities.at(joint_order[joint.name]));
-          if (accel_size != 0)
-            jnt_tra_point_msg.accelerations.push_back(msg.points.at(cntr).accelerations.at(joint_order[joint.name]));
-        }
-      }
-      jnt_tra_msg.points.push_back(jnt_tra_point_msg);
-      cntr++;
-    }
-    // Make sure that the initial joint positions in the trajectory match the current
-    // joint states (with an arbitrary error less than 0.1 rad)
-    size_t itr = 0;
-    for (auto const& joint:arm_joints)
-    {
-      if (joint.name != "gripper")
-      {
-        if (!(fabs(jnt_tra_msg.points[0].positions.at(itr) - joint_states.position.at(itr)) < 0.1))
-        {
-          ROS_WARN("%s motor is not at the correct initial state.", joint_states.name.at(itr).c_str());
-          ROS_WARN("Expected state: %f, Actual State: %f.", jnt_tra_msg.points.at(0).positions.at(itr), joint_states.position.at(itr));
-        }
-        itr++;
-      }
-    }
-    ROS_INFO("Succeeded to get joint trajectory!");
-    joint_start_time = ros::Time::now().toSec();
-    execute_joint_traj = true;
-  }
-  else
-  {
-    ROS_WARN("Arm joints are still moving");
-  }
+  arm_send_joint_trajectory(msg);
 }
 
 /// @brief ROS Subscriber callback function to a user-provided joint trajectory for the gripper only
@@ -1000,30 +1272,7 @@ void RobotArm::arm_joint_trajectory_msg_callback(const trajectory_msgs::JointTra
 /// @details - Commands should only be for the 'left_finger' joint and must specify half the desired distance between the fingers
 void RobotArm::arm_gripper_trajectory_msg_callback(const trajectory_msgs::JointTrajectory &msg)
 {
-  if (execute_gripper_traj == false)
-  {
-    gripper_tra_msg.joint_names.clear();
-    gripper_tra_msg.points.clear();
-    gripper_tra_msg = msg;
-
-    // Make sure that the initial gripper position in the trajectory matches the current
-    // gripper position (with an arbitrary error less than 0.1 rad)
-    // Note that MoveIt sends the desired position of the 'left_finger_link'. In the joint_states message,
-    // this is located right after the gripper position in radians (conveniently, this index matches arm_joints.size())
-    if (!(fabs(gripper_tra_msg.points.at(0).positions.at(0) - joint_states.position.at(arm_joints.size())) < 0.1))
-    {
-      ROS_WARN("Gripper motor is not at the correct initial state.");
-      ROS_WARN("Expected state: %f, Actual State: %f.", gripper_tra_msg.points.at(0).positions.at(0), joint_states.position.at(arm_joints.size()));
-    }
-
-    ROS_INFO("Succeeded to get gripper trajectory!");
-    gripper_start_time = ros::Time::now().toSec();
-    execute_gripper_traj = true;
-  }
-  else
-  {
-    ROS_WARN("Gripper is still moving");
-  }
+  send_gripper_trajectory(msg);
 }
 
 /// @brief ROS Service to torque on all joints
@@ -1049,32 +1298,7 @@ bool RobotArm::arm_torque_joints_off(std_srvs::Empty::Request &req, std_srvs::Em
 /// @param res [out] - all types of robot info!!!!!
 bool RobotArm::arm_get_robot_info(interbotix_sdk::RobotInfo::Request &req, interbotix_sdk::RobotInfo::Response &res)
 {
-  // Parse the urdf model to get joint position and velocity limits
-  urdf::Model model;
-  model.initParam(robot_name + "/robot_description");
-  for (auto const& joint:all_joints)
-  {
-    urdf::JointConstSharedPtr ptr;
-    if (joint.name == "gripper" && use_default_gripper_bar && use_default_gripper_fingers)
-    {
-      ptr = model.getJoint("left_finger");
-      res.lower_gripper_limit = ptr->limits->lower;
-      res.upper_gripper_limit = ptr->limits->upper;
-      res.use_gripper = true;
-    }
-    ptr = model.getJoint(joint.name);
-    res.lower_joint_limits.push_back(ptr->limits->lower);
-    res.upper_joint_limits.push_back(ptr->limits->upper);
-    res.velocity_limits.push_back(ptr->limits->velocity);
-    res.joint_names.push_back(joint.name);
-    res.joint_ids.push_back(joint.motor_id);
-  }
-
-  res.home_pos = home_positions;
-  res.sleep_pos = sleep_positions;
-  res.num_joints = joint_num_write;
-  res.num_single_joints = all_joints.size();
-  return true;
+  return arm_get_robot_info(res);
 }
 
 /// @brief ROS Service that allows the user to change operating modes (position, velocity, pwm) and set profiles
@@ -1082,41 +1306,7 @@ bool RobotArm::arm_get_robot_info(interbotix_sdk::RobotInfo::Request &req, inter
 /// @param res [out] - no message is returned
 bool RobotArm::arm_set_operating_modes(interbotix_sdk::OperatingModes::Request &req, interbotix_sdk::OperatingModes::Response &res)
 {
-  bool result = true;
-  if (req.cmd == interbotix_sdk::OperatingModes::Request::GRIPPER || req.cmd == interbotix_sdk::OperatingModes::Request::ARM_JOINTS_AND_GRIPPER)
-  {
-    if (req.use_custom_profiles)
-      result = arm_set_single_joint_operating_mode("gripper", req.mode, req.profile_velocity, req.profile_acceleration);
-    else
-      result = arm_set_single_joint_operating_mode("gripper", req.mode);
-  }
-
-  if (!result)
-    return false;
-
-  if (req.cmd == interbotix_sdk::OperatingModes::Request::ARM_JOINTS_AND_GRIPPER || req.cmd == interbotix_sdk::OperatingModes::Request::ARM_JOINTS)
-  {
-    if (req.use_custom_profiles)
-      result = arm_set_joint_operating_mode(req.mode, req.profile_velocity, req.profile_acceleration);
-    else
-      result = arm_set_joint_operating_mode(req.mode);
-  }
-
-  if (!result)
-    return false;
-
-  if (req.cmd == interbotix_sdk::OperatingModes::Request::SINGLE_JOINT)
-  {
-    if (req.use_custom_profiles)
-      result = arm_set_single_joint_operating_mode(req.joint_name, req.mode, req.profile_velocity, req.profile_acceleration);
-    else
-      result = arm_set_single_joint_operating_mode(req.joint_name, req.mode);
-  }
-
-  if (!result)
-    return false;
-
-  return true;
+  return arm_set_operating_modes(req);
 }
 
 /// @brief ROS Service that allows the user to set the Position, Velocity, and Feedforward gains used in the motor firmware
@@ -1324,134 +1514,8 @@ bool RobotArm::arm_get_firmware_register_values(interbotix_sdk::RegisterValues::
 /// @brief ROS Timer that reads current states from all the motors and publishes them to the joint_states topic
 void RobotArm::arm_update_joint_states(const ros::TimerEvent &e)
 {
-  bool result = false;
-  const char* log = NULL;
-
-  sensor_msgs::JointState joint_state_msg;
-
-  int32_t get_current[all_joints.size()];
-  int32_t get_velocity[all_joints.size()];
-  int32_t get_position[all_joints.size()];
-
-  if (dxl_wb.getProtocolVersion() == 2.0f)
-  {
-
-    result = dxl_wb.syncRead(SYNC_READ_HANDLER_FOR_PRESENT_POSITION_VELOCITY_CURRENT,
-                                joint_ids_read,
-                                all_joints.size(),
-                                &log);
-    arm_check_error(result, &log);
-    result = dxl_wb.getSyncReadData(SYNC_READ_HANDLER_FOR_PRESENT_POSITION_VELOCITY_CURRENT,
-                                                  joint_ids_read,
-                                                  all_joints.size(),
-                                                  control_items["Present_Current"]->address,
-                                                  control_items["Present_Current"]->data_length,
-                                                  get_current,
-                                                  &log);
-    arm_check_error(result, &log);
-    result = dxl_wb.getSyncReadData(SYNC_READ_HANDLER_FOR_PRESENT_POSITION_VELOCITY_CURRENT,
-                                                  joint_ids_read,
-                                                  all_joints.size(),
-                                                  control_items["Present_Velocity"]->address,
-                                                  control_items["Present_Velocity"]->data_length,
-                                                  get_velocity,
-                                                  &log);
-    arm_check_error(result, &log);
-    result = dxl_wb.getSyncReadData(SYNC_READ_HANDLER_FOR_PRESENT_POSITION_VELOCITY_CURRENT,
-                                                  joint_ids_read,
-                                                  all_joints.size(),
-                                                  control_items["Present_Position"]->address,
-                                                  control_items["Present_Position"]->data_length,
-                                                  get_position,
-                                                  &log);
-    arm_check_error(result, &log);
-
-    uint8_t index = 0;
-    for(auto const& joint:all_joints)
-    {
-      double position = 0.0;
-      double velocity = 0.0;
-      double effort = 0.0;
-      // Convert raw register values to the metric system
-      if (strcmp(dxl_wb.getModelName(joint.motor_id), "XL-320") == 0) effort = dxl_wb.convertValue2Load(get_current[index]);
-      else  effort = dxl_wb.convertValue2Current(get_current[index]);
-      velocity = dxl_wb.convertValue2Velocity(joint.motor_id, get_velocity[index]);
-      position = dxl_wb.convertValue2Radian(joint.motor_id, get_position[index]);
-      joint_state_msg.name.push_back(joint.name);
-      joint_state_msg.effort.push_back(effort);
-      joint_state_msg.velocity.push_back(velocity);
-      joint_state_msg.position.push_back(position);
-      // If reading the 'gripper' motor, make sure to also add the finger positions in meters
-      if (joint.name == "gripper" && use_default_gripper_bar && use_default_gripper_fingers)
-      {
-        joint_state_msg.name.push_back("left_finger");
-        joint_state_msg.name.push_back("right_finger");
-        gripper_effort = effort;
-        position = arm_calculate_gripper_linear_position(position);
-        joint_state_msg.position.push_back(position);
-        joint_state_msg.position.push_back(-position);
-        // put a '0' placeholder in the velocity and effort fields for the fingers as well
-        joint_state_msg.velocity.push_back(0);
-        joint_state_msg.velocity.push_back(0);
-        joint_state_msg.effort.push_back(0);
-        joint_state_msg.effort.push_back(0);
-      }
-      index++;
-    }
-  }
-  else if(dxl_wb.getProtocolVersion() == 1.0f)
-  {
-    uint16_t length_of_data = control_items["Present_Position"]->data_length +
-                              control_items["Present_Velocity"]->data_length +
-                              control_items["Present_Current"]->data_length;
-    uint32_t get_all_data[length_of_data];
-
-    for (auto const& joint:all_joints)
-    {
-      result = dxl_wb.readRegister(joint.motor_id,
-                                     control_items["Present_Position"]->address,
-                                     length_of_data,
-                                     get_all_data,
-                                     &log);
-      arm_check_error(result, &log);
-      int16_t effort_raw = DXL_MAKEWORD(get_all_data[4], get_all_data[5]);
-      int32_t velocity_raw = DXL_MAKEWORD(get_all_data[2], get_all_data[3]);
-      int32_t position_raw = DXL_MAKEWORD(get_all_data[0], get_all_data[1]);
-
-      double position = 0.0;
-      double velocity = 0.0;
-      double effort = 0.0;
-
-      // Convert raw register values to the metric system
-      effort = dxl_wb.convertValue2Load(effort_raw);
-      velocity = dxl_wb.convertValue2Velocity(joint.motor_id, velocity_raw);
-      position = dxl_wb.convertValue2Radian(joint.motor_id, position_raw);
-
-      joint_state_msg.name.push_back(joint.name);
-      joint_state_msg.effort.push_back(effort);
-      joint_state_msg.velocity.push_back(velocity);
-      joint_state_msg.position.push_back(position);
-      // If reading the 'gripper' motor, make sure to also add the finger positions in meters
-      if (joint.name == "gripper" && use_default_gripper_bar && use_default_gripper_fingers)
-      {
-        joint_state_msg.name.push_back("left_finger");
-        joint_state_msg.name.push_back("right_finger");
-        gripper_effort = effort;
-        position = arm_calculate_gripper_linear_position(position);
-        joint_state_msg.position.push_back(position);
-        joint_state_msg.position.push_back(-position);
-        // put a '0' placeholder in the velocity and effort fields for the fingers as well
-        joint_state_msg.velocity.push_back(0);
-        joint_state_msg.velocity.push_back(0);
-        joint_state_msg.effort.push_back(0);
-        joint_state_msg.effort.push_back(0);
-      }
-    }
-  }
-  // Publish the message to the joint_states topic
-  joint_state_msg.header.stamp = ros::Time::now();
-  joint_states = joint_state_msg;
-  pub_joint_states.publish(joint_state_msg);
+  joint_states = arm_get_joint_states();
+  pub_joint_states.publish(joint_states);
 }
 
 /// @brief ROS Timer that executes a joint trajectory for the arm (excludes gripper)

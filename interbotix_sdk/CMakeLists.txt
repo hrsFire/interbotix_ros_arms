@@ -98,7 +98,7 @@ include_directories(
 )
 
 ## Declare a C++ library
-add_library(${PROJECT_NAME}
+add_library(${PROJECT_NAME} SHARED
   src/arm_obj.cpp
   src/pid.cpp
 )
