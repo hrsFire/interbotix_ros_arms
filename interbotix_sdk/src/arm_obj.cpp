@@ -1,5 +1,11 @@
 #include "interbotix_sdk/arm_obj.h"
 
+#ifdef COMMUNICATION_MEASUREMENT
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#endif //COMMUNICATION_MEASUREMENT
+
 /// @brief Node free constructor for the RobotArm
 RobotArm::RobotArm(const std::string robot_name, const std::string robot_model, const double timer_hz)
     : robot_name(robot_name), robot_model(robot_model), timer_hz(timer_hz)
@@ -51,6 +57,10 @@ RobotArm::~RobotArm()
     delete joint_action_server;
     delete gripper_action_server;
   }
+
+#ifdef COMMUNICATION_MEASUREMENT
+  delete communicationMeasurementFile;
+#endif //COMMUNICATION_MEASUREMENT
 }
 
 /// @brief Set operating mode for the arm joints to position [rad] control
@@ -511,6 +521,10 @@ sensor_msgs::JointState RobotArm::arm_get_joint_states()
 /// @brief Send joint trajectory for the arm (excludes gripper)
 /// @param msg - user-provided joint trajectory using the trajectory_msgs::JointTrajectory message type
 void RobotArm::arm_send_joint_trajectory(const trajectory_msgs::JointTrajectory &msg) {
+#ifdef COMMUNICATION_MEASUREMENT
+  SaveCommunicationMeasurement(*communicationMeasurementFile);
+#endif //COMMUNICATION_MEASUREMENT
+
   if (execute_joint_traj == false)
   {
     // For some reason, Moveit organizes the joint data in the trajectory message in alphabetical order. Thus,
@@ -584,6 +598,10 @@ void RobotArm::arm_send_joint_trajectory(const trajectory_msgs::JointTrajectory 
 /// @param msg - user-provided joint trajectory using the trajectory_msgs::JointTrajectory message type
 /// @details - Commands should only be for the 'left_finger' joint and must specify half the desired distance between the fingers
 void RobotArm::send_gripper_trajectory(const trajectory_msgs::JointTrajectory &msg) {
+#ifdef COMMUNICATION_MEASUREMENT
+  SaveCommunicationMeasurement(*communicationMeasurementFile);
+#endif //COMMUNICATION_MEASUREMENT
+
   if (execute_gripper_traj == false)
   {
     gripper_tra_msg.joint_names.clear();
@@ -611,6 +629,10 @@ void RobotArm::send_gripper_trajectory(const trajectory_msgs::JointTrajectory &m
 }
 
 void RobotArm::arm_send_joint_commands(const interbotix_sdk::JointCommands &msg) {
+#ifdef COMMUNICATION_MEASUREMENT
+  SaveCommunicationMeasurement(*communicationMeasurementFile);
+#endif //COMMUNICATION_MEASUREMENT
+
   switch(arm_operating_mode)
   {
     case State::POSITION:
@@ -660,6 +682,10 @@ void RobotArm::arm_send_joint_commands(const interbotix_sdk::JointCommands &msg)
 /// @brief Send any type of gripper command
 /// @param msg - accepts either an angular position [rad], linear position [m], velocity [rad/s], current [mA], or pwm command
 void RobotArm::arm_send_gripper_command(const std_msgs::Float64 &msg) {
+#ifdef COMMUNICATION_MEASUREMENT
+  SaveCommunicationMeasurement(*communicationMeasurementFile);
+#endif //COMMUNICATION_MEASUREMENT
+
   switch(joint_map["gripper"].mode)
   {
     case State::POSITION:
@@ -702,6 +728,10 @@ void RobotArm::arm_send_gripper_command(const std_msgs::Float64 &msg) {
 /// @brief Send any type of command to a specified joint
 /// @param msg - accepts either an angular position [rad], velocity [rad/s], current [mA], or pwm command
 void RobotArm::arm_send_single_joint_command(const interbotix_sdk::SingleCommand &msg) {
+#ifdef COMMUNICATION_MEASUREMENT
+  SaveCommunicationMeasurement(*communicationMeasurementFile);
+#endif //COMMUNICATION_MEASUREMENT
+
   switch(joint_map[msg.joint_name].mode)
   {
     case State::POSITION:
@@ -740,6 +770,10 @@ void RobotArm::arm_send_single_joint_command(const interbotix_sdk::SingleCommand
 /// @brief Set the operating modes (position, velocity, current, pwm) and set profiles
 /// @param req - custom message of type 'OperatingModes'. Look at the service message for details
 bool RobotArm::arm_set_operating_modes(interbotix_sdk::OperatingModes::Request &req) {
+#ifdef COMMUNICATION_MEASUREMENT
+  SaveCommunicationMeasurement(*communicationMeasurementFile);
+#endif //COMMUNICATION_MEASUREMENT
+
   bool result = true;
   if (req.cmd == interbotix_sdk::OperatingModes::Request::GRIPPER || req.cmd == interbotix_sdk::OperatingModes::Request::ARM_JOINTS_AND_GRIPPER)
   {
@@ -811,6 +845,11 @@ bool RobotArm::arm_get_robot_info(interbotix_sdk::RobotInfo::Response &res) {
 /// @brief Initializes the port to talk to the Dynamixel motors
 void RobotArm::arm_init_port(void)
 {
+#ifdef COMMUNICATION_MEASUREMENT
+  communicationMeasurementFile = InitializeMeasurementFile("interbotix_sdk_communication_measurement.csv");
+  startTime = std::chrono::system_clock::now();
+#endif //COMMUNICATION_MEASUREMENT
+
   std::string port;
   ros::param::param<std::string>("~port", port, PORT);
 
@@ -1859,3 +1898,39 @@ void RobotArm::arm_check_error(bool result, const char** log)
   if (result == false)
     ROS_ERROR("%s", *log);
 }
+
+#ifdef COMMUNICATION_MEASUREMENT
+std::ofstream* RobotArm::InitializeMeasurementFile(const std::string& fileName) {
+  const char* homedir;
+
+#ifdef unix
+  // https://stackoverflow.com/questions/2910377/get-home-directory-in-linux/26696759
+  if ((homedir = getenv("HOME")) == NULL) {
+      homedir = getpwuid(getuid())->pw_dir;
+  }
+#elif defined(_WIN32)
+  homedir = getenv("USERPROFILE");
+#endif
+
+  std::string directoryPath = "/home/ubuntu";//homedir; // TODO:
+  std::ofstream* measurementFile = new std::ofstream(directoryPath + "/" + fileName, std::ios::out | std::ios::trunc);
+  *measurementFile << "Time [TT.MM.JJJJ HH:MM:SS.zzz]" << std::endl;
+
+  return measurementFile;
+}
+
+void RobotArm::SaveCommunicationMeasurement(std::ofstream& measurementFile) {
+    std::chrono::system_clock::time_point currentTime = std::chrono::system_clock::now();
+    auto tt = std::chrono::system_clock::to_time_t(currentTime);
+    std::tm* ttm = localtime(&tt);
+    char buffer[26];
+    strftime(buffer, 26, "%d.%m.%Y %H:%M:%S", ttm);
+    std::chrono::seconds::rep milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime.time_since_epoch()).count() % 1000;
+    char fractionBuffer[4];
+    sprintf(fractionBuffer, "%03d", milliseconds);
+    std::string timeString = std::string(buffer) + "." + std::string(fractionBuffer);
+
+    measurementFile << timeString << std::endl;
+    measurementFile.flush();
+}
+#endif //COMMUNICATION_MEASUREMENT

@@ -21,6 +21,15 @@
 #include "interbotix_sdk/RobotInfo.h"
 #include "interbotix_sdk/pid.h"
 
+#ifdef COMMUNICATION_MEASUREMENT
+#include <chrono>
+
+#ifdef unix
+#include <unistd.h>
+#include <pwd.h>
+#endif
+#endif //COMMUNICATION_MEASUREMENT
+
 #define BAUDRATE 1000000                                                // All motors are preset to 1M baud
 #define PORT "/dev/ttyDXL"                                              // Udev rule creates a symlink with this name
 #define SYNC_WRITE_HANDLER_FOR_GOAL_POSITION 0                          // Write goal positions [rad] to multiple motors at the same time
@@ -420,6 +429,12 @@ private:
     /// @param result - boolean returned from a function that is True if it executed correctly
     /// @param log - error message to be output if the function did not run correctly
     void arm_check_error(bool result, const char** log);
+#ifdef COMMUNICATION_MEASUREMENT
+    std::ofstream* InitializeMeasurementFile(const std::string& fileName);
+    void SaveCommunicationMeasurement(std::ofstream& measurementFile);
+    std::ofstream* communicationMeasurementFile = nullptr;
+    std::chrono::system_clock::time_point startTime;
+#endif //COMMUNICATION_MEASUREMENT
 };
 
 #endif
